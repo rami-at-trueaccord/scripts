@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:
+  "This CloudFormation template deploys a Lambda function that sets up
+  the resources necessary to encrypt all objects retroactively in
+  target S3 buckets."
+
+Parameters:
+  S3BucketWhereLambdaZipFileIsStored:
+    Description: 'Enter the name (not the ARN) of the S3 Bucket where the
+      zipped Lambda code is stored. The zipped file containing the
+      code must be named "encrypt.zip" and the bucket must be in the
+      same region in which this template is being deployed.'
+    Type: String
+    AllowedPattern: '(?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)'
+
+  S3TargetTagKey:
+    Description:
+      "Enter the name of the tag key that specifies which S3 buckets should
+      be targeted for the generation of S3 Inventory reports and optionally encryption.
+      Target S3 buckets must be tagged with the value specified here. Target buckets
+      must be in the same region in which this template is being deployed in order for
+      S3 Inventory to work."
+    Default: "__Inventory"
+    Type: String
+
+  S3TargetTagValue:
+    Description:
+      "Enter the name of the tag value that specifies which S3 buckets should
+      be targeted for the generation of S3 Inventory reports and optionally encryption.
+      Target S3 buckets must be tagged with the value specified here. Target buckets
+      must be in the same region in which this template is being deployed in order for S3
+      Inventory to work."
+    Default: "true"
+    Type: String
+
+  S3ObjectTagKey:
+    Description:
+      'The tag key that will be added to each object that is encrypted if the
+      "AddTagToEncryptedObjects" parameter is set to "yes". Existing tags on the
+      objects will not be overwritten. If the "AddTagToEncryptedObjects" is set to "no"
+      then this parameter can be ignored.'
+    Default: "__ObjectEncrypted"
+    Type: String
+
+  S3ObjectTagValue:
+    Description:
+      'The tag value that will be added to each object that is encrypted if the
+      "AddTagToEncryptedObjects" parameter is set to "yes". Existing tags on the
+      objects will not be overwritten. If the "AddTagToEncryptedObjects" is set to "no"
+      then this parameter can be ignored.'
+    Default: "true"
+    Type: String
+
+  AutoDeleteS3InventoryConfigurations:
+    Description:
+      "This option allows you to chose whether or not to keep S3 Inventory
+      active on a target bucket after an S3 Inventory report has been successfully
+      created for the bucket or after an S3 target tag key/pair has been removed
+      from a bucket."
+    Default: "yes"
+    Type: String
+    AllowedValues:
+      - "yes"
+      - "no"
+
+  S3InventoryReportsName:
+    Description:
+      "Enter a name identifier for the S3 Inventory reports that will be
+      configured for the target buckets."
+    Default: "ObjectEncryptionInventoryReport"
+    Type: String
+
+  EncryptBuckets:
+    Description:
+      'If this parameter is set to "yes", this solution will encrypt objects in targeted
+      S3 buckets. If it is set to "no" then only S3 Inventory reports will be configured for the
+      target S3 buckets and the "SSEType", "KMSKeyId", "AddTagToEncryptedObjects", "S3ObjectTagKey",
+      and "S3ObjectTagValue" parameters
+      can be ignored. This functionality is included in case someone only wants to see
+      the encryption data from the reports, but does not want to proceed with encrypting
+      all objects in the targeted buckets.
+
+      This parameter can be updated after deployment by performing a stack update for
+      the CloudFormation template. Please note that every time the parameter is
+      updated, a new round of S3 Inventory reports needs to be completed for the target buckets.'
+    Default: "no"
+    Type: String
+    AllowedValues:
+      - "yes"
+      - "no"
+
+  SSEType:
+    Description:
+      "Choose whether to encrypt buckets using SSE-S3 encryption or SSE-KMS encryption. If SSE-S3
+      encryption is chosen, then the parameter value for KMSKeyId will be ignored."
+    Type: String
+    Default: "SSE-S3"
+    AllowedValues:
+      - "SSE-S3"
+      - "SSE-KMS"
+
+  KMSKeyId:
+    Description:
+      "This parameter is only used if the SSEType parameter is set to SSE-KMS. Enter the name of
+      the KMS key id that you want to use to encrypt objects in buckets. An example would be:
+      1232d31d-g092-986a-jf03-9e9d377d6374. Please note that the key policy for the chosen key will 
+      be automatically updated by a Lambda-backed custom resource to allow for S3 to use the key. S3 
+      needs to be able to access this key in order to encrypt delivered S3 Inventory reports properly."
+    Type: String
+    Default: ""
+
+  S3PutEventNotificationTriggerNameInv:
+    Description:
+      'Enter a name for the S3 event that will be triggered when new S3 Inventory
+      report manifest files will be dropped into the inventory reports bucket. This event
+      will trigger a Lambda that launches an S3 Batch job to process the newly completed S3 Inventory report
+      if the "EncryptBuckets" parameter is set to "yes". It will also add the new data as a partition 
+      in the inventory reports Glue table.'
+    Default: "InvManifestUploadedEventNotification"
+    Type: String
+  
+  S3PutEventNotificationTriggerNameBatch:
+    Description:
+      'Enter a name for the S3 event that will be triggered when new S3 Batch completion
+      report manifest files will be dropped into the batch reports bucket. The event notification will 
+      trigger a Lambda that adds the new data as a partition in the batch reports Glue table.'
+    Default: "BatchManifestUploadedEventNotification"
+    Type: String
+
+  GlueDatabaseName:
+    Description:
+      "The name of the Glue database that will hold the tables used by Athena for easy querying of
+      S3 Inventory and S3 Batch completion reports. Letters must be lowercase. You can specify the name 
+      of an existing database, otherwise a new one will be created."
+    Default: "s3_inventory_database"
+    Type: String
+
+  GlueTableNameS3Inventory:
+    Description:
+      "The name of the Glue table that be used by Athena for easy querying of
+      S3 Inventory reports. Letters must be lowercase."
+    Default: "s3_inventory_table"
+    Type: String
+
+  GlueTableNameS3Batch:
+    Description:
+      "The name of the Glue table that be used by Athena for easy querying of
+      S3 Inventory reports. Letters must be lowercase."
+    Default: "s3_batch_table"
+    Type: String
+
+  S3BatchReportScope:
+    Description:
+      'Specify the reporting level of S3 Batch job completion reports. If set to "AllTasks",
+      all Batch operations will be reported. If set to "FailedTasksOnly", then only
+      failed Batch operations will be recorded in the reports.'
+    Default: "FailedTasksOnly"
+    Type: String
+    AllowedValues:
+      - "FailedTasksOnly"
+      - "AllTasks"
+
+  AddTagToEncryptedObjects:
+    Description:
+      'If set to "yes", a tag key value pair will be added to each object that is encrypted.
+      Afterwards, buckets with the newly and correctly encrypted objects can have bucket policies
+      applied to them that only permit the retrieval of objects with the tag key value pair. This
+      is especially useful for buckets with versioning turned on, because it means that individuals
+      will effectively be unable to retrieve old unencrypted versions of an object.
+
+      Due to this reason, it is strongly recommended that this parameter is set to "yes" if there
+      are buckets with versioning turned on that will be targeted for the encryption process.'
+    Default: "no"
+    Type: String
+    AllowedValues:
+      - "yes"
+      - "no"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Configuration Options
+        Parameters:
+          - S3BucketWhereLambdaZipFileIsStored
+          - S3TargetTagKey
+          - S3TargetTagValue
+          - EncryptBuckets
+          - SSEType
+          - KMSKeyId
+          - AddTagToEncryptedObjects
+          - S3ObjectTagKey
+          - S3ObjectTagValue
+          - AutoDeleteS3InventoryConfigurations
+          - S3BatchReportScope
+
+      - Label:
+          default: Resource Names
+        Parameters:
+          - S3InventoryReportsName
+          - S3PutEventNotificationTriggerNameInv
+          - S3PutEventNotificationTriggerNameBatch
+          - GlueDatabaseName
+          - GlueTableNameS3Inventory
+          - GlueTableNameS3Batch
+
+Conditions:
+  EncryptBucketsCondition: !Equals [!Ref EncryptBuckets, "yes"]
+  SSETypeCondition: !Equals [!Ref SSEType, "SSE-KMS"]
+  TagObjectsCondition: !Equals [!Ref AddTagToEncryptedObjects, "yes"]
+
+Resources:
+  S3InventoryReportsDestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  S3BatchReportsDestinationBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+
+  GlueTableS3Inventory:
+    DependsOn: InitializeResourcesUsingTheEncryptorController
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Description: "This table is used by Amazon Athena to query S3 Inventory reports."
+        Name: !Ref GlueTableNameS3Inventory
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: "b_name"
+            Type: "string"
+        StorageDescriptor:
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Columns:
+            - Name: "bucket_name"
+              Type: "string"
+            - Name: "key_name"
+              Type: "string"
+            - Name: "version_id"
+              Type: "string"
+            - Name: "is_latest"
+              Type: "string"
+            - Name: "delete_marker"
+              Type: "string"
+            - Name: "encryption_status"
+              Type: "string"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          SerdeInfo:
+            SerializationLibrary: "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            Parameters:
+              field.delim: ","
+          Location: !Sub s3://${S3InventoryReportsDestinationBucket}/
+
+  GlueTableS3Batch:
+    DependsOn: InitializeResourcesUsingTheEncryptorController
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Description: "This table is used by Amazon Athena to query S3 Batch job completion reports."
+        Name: !Ref GlueTableNameS3Batch
+        TableType: EXTERNAL_TABLE
+        PartitionKeys:
+          - Name: "b_name"
+            Type: "string"
+        StorageDescriptor:
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          Columns:
+            - Name: "bucket_name"
+              Type: "string"
+            - Name: "key_name"
+              Type: "string"
+            - Name: "version_id"
+              Type: "string"
+            - Name: "task_status"
+              Type: "string"
+            - Name: "error_code"
+              Type: "string"
+            - Name: "http_status_code"
+              Type: "string"
+            - Name: "result_message"
+              Type: "string"
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          SerdeInfo:
+            SerializationLibrary: "org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe"
+            Parameters:
+              field.delim: ","
+          Location: !Sub s3://${S3BatchReportsDestinationBucket}/
+
+  EncryptorControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Roles:
+        - !Ref EncryptorControllerRole
+      Description: "IAM policy for the Lambda encryption controller."
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "LAMBDAPassRoleForS3Batch"
+            Effect: "Allow"
+            Action:
+              - "iam:GetRole"
+              - "iam:PassRole"
+            Resource: !GetAtt EncryptorControllerRole.Arn
+          - Sid: "LAMBDABucketPolicyForReportBucket"
+            Effect: "Allow"
+            Action:
+              - "s3:GetBucketNotification"
+              - "s3:PutBucketNotification"
+              - "s3:GetBucketNotificationConfiguration"
+              - "s3:PutBucketNotificationConfiguration"
+              - "s3:PutBucketPolicy"
+              - "s3:GetBucketPolicy"
+            Resource: !GetAtt S3InventoryReportsDestinationBucket.Arn
+          - Sid: "LAMBDABucketPolicyForBatchBucket"
+            Effect: "Allow"
+            Action:
+              - "s3:GetBucketNotification"
+              - "s3:PutBucketNotification"
+              - "s3:GetBucketNotificationConfiguration"
+              - "s3:PutBucketNotificationConfiguration"
+            Resource: !GetAtt S3BatchReportsDestinationBucket.Arn
+          - Sid: "LAMBDAConfigureTargetBuckets"
+            Effect: "Allow"
+            Action:
+              - "s3:ListAllMyBuckets"
+              - "s3:GetBucketTagging"
+              - "s3:PutInventoryConfiguration"
+            Resource:
+              - "*"
+          - Sid: "LAMBDACreateBatchJob"
+            Effect: "Allow"
+            Action:
+              - "s3:CreateJob"
+            Resource:
+              - "*"
+          - Sid: "LAMBDACloudwatchLogs"
+            Effect: "Allow"
+            Action:
+              - "logs:CreateLogGroup"
+              - "logs:CreateLogStream"
+              - "logs:PutLogEvents"
+            Resource:
+              - "*"
+          - Sid: "LAMBDAAccountInformation"
+            Effect: "Allow"
+            Action:
+              - "sts:GetCallerIdentity"
+            Resource:
+              - "*"
+          - Sid: "BATCHS3BatchCopy"
+            Effect: "Allow"
+            Action:
+              - "s3:PutObject"
+              - "s3:PutObjectAcl"
+              - "s3:PutObjectTagging"
+              - "s3:GetObject"
+              - "s3:GetObjectAcl"
+              - "s3:GetObjectTagging"
+              - "s3:GetObjectVersion"
+              - "s3:GetBucketLocation"
+            Resource:
+              - "*"
+          - Sid: "BATCHandS3KmsPermissions"
+            Effect: "Allow"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+              - "kms:ReEncrypt*"
+              - !If [
+                  EncryptBucketsCondition,
+                  !If [SSETypeCondition, "kms:Put*", "kms:ignore"],
+                  "kms:ignore",
+                ]
+              - !If [
+                  EncryptBucketsCondition,
+                  !If [SSETypeCondition, "kms:Get*", "kms:ignore"],
+                  "kms:ignore",
+                ]
+            Resource:
+              - "*"
+          - Sid: LAMBDAAddPartition
+            Effect: "Allow"
+            Action:
+              - "glue:CreatePartition"
+              - "glue:CreateDatabase"
+            Resource:
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableNameS3Inventory}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableNameS3Batch}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+          - Sid: BATCHAllowFunctionInvoke
+            Effect: "Allow"
+            Action:
+              - !If [
+                  TagObjectsCondition,
+                  "lambda:InvokeFunction",
+                  "lambda:ignore",
+                ]
+            Resource:
+              - !GetAtt EncryptorControllerLambdaFunction.Arn
+
+  EncryptorControllerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+                - "batchoperations.s3.amazonaws.com"
+            Action: "sts:AssumeRole"
+
+  EncryptorControllerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref S3BucketWhereLambdaZipFileIsStored
+        S3Key: "encrypt.zip"
+      Description:
+        "This Lambda function handles the setup of S3 Inventory and S3 Batch jobs
+        for target buckets."
+      Handler: "encrypt.handler"
+      Role: !GetAtt EncryptorControllerRole.Arn
+      Runtime: "python3.7"
+      Timeout: 900
+      Environment:
+        Variables:
+          S3InventoriesName: !Ref S3InventoryReportsName
+          S3EventIdInv: !Ref S3PutEventNotificationTriggerNameInv
+          S3EventIdBatch: !Ref S3PutEventNotificationTriggerNameBatch
+          S3TargetTagKey: !Ref S3TargetTagKey
+          S3TargetTagValue: !Ref S3TargetTagValue
+          S3InvReportsBucket: !Ref S3InventoryReportsDestinationBucket
+          S3BatchReportsBucket: !Ref S3BatchReportsDestinationBucket
+          KmsKey: !Ref KMSKeyId
+          SSEType: !Ref SSEType
+          RoleArn: !GetAtt EncryptorControllerRole.Arn
+          RemoveS3InvConfig: !Ref AutoDeleteS3InventoryConfigurations
+          Encrypt: !Ref EncryptBuckets
+          DeploymentRegion: !Ref "AWS::Region"
+          ReportingLevel: !Ref S3BatchReportScope
+          DBName: !Ref GlueDatabaseName
+          TBLNameInv: !Ref GlueTableNameS3Inventory
+          TBLNameBatch: !Ref GlueTableNameS3Batch
+          AddTag: !Ref AddTagToEncryptedObjects
+          ObjectTagKey: !Ref S3ObjectTagKey
+          ObjectTagValue: !Ref S3ObjectTagValue
+
+  LambdaInvokePermissionForS3InvRepBucket:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EncryptorControllerLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !GetAtt S3InventoryReportsDestinationBucket.Arn
+  
+  LambdaInvokePermissionForS3BatchRepBucket:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EncryptorControllerLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref "AWS::AccountId"
+      SourceArn: !GetAtt S3BatchReportsDestinationBucket.Arn
+
+  CloudWatchRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        detail-type:
+          - "AWS API Call via CloudTrail"
+        detail:
+          eventSource:
+            - "s3.amazonaws.com"
+          eventName:
+            - "PutBucketTagging"
+        source:
+          - "aws.s3"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt EncryptorControllerLambdaFunction.Arn
+          Id: EncryptorController
+
+  LambdaInvokePermissionForCloudWatch:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EncryptorControllerLambdaFunction.Arn
+      Action: "lambda:InvokeFunction"
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudWatchRule.Arn
+
+  InitializeResourcesUsingTheEncryptorController:
+    DependsOn:
+      - LambdaInvokePermissionForS3InvRepBucket
+      - LambdaInvokePermissionForS3BatchRepBucket
+      - EncryptorControllerLambdaFunction
+      - EncryptorControllerPolicy
+      - LambdaInvokePermissionForCloudWatch
+      - CloudWatchRule
+      - S3InventoryReportsDestinationBucket
+      - S3BatchReportsDestinationBucket
+    Type: "Custom::ResourceInitializer"
+    Properties:
+      ServiceToken: !GetAtt EncryptorControllerLambdaFunction.Arn
+      Encrypt: !Ref EncryptBuckets
+
+Outputs:
+  ReportsBucketInv:
+    Description: "This is the name of the bucket in which S3 Inventory reports will be stored."
+    Value: !GetAtt InitializeResourcesUsingTheEncryptorController.S3InvReportBucketName
+  ReportsBucketBatch:
+    Description: "This is the name of the bucket in which S3 Batch job completion reports will be stored."
+    Value: !GetAtt InitializeResourcesUsingTheEncryptorController.S3BatchReportBucketName
+  LambdaFunction:
+    Description:
+      "This is the ARN of the lambda function that handles the provisioning of
+      the S3 Inventory reports bucket, S3 event notifications, and S3 Batch jobs."
+    Value: !GetAtt EncryptorControllerLambdaFunction.Arn
+  RoleArn:
+    Description:
+      "This is the ARN of the role that is used by Lambda, S3, and S3 Batch to retroactively
+      encrypt objects in S3."
+    Value: !GetAtt EncryptorControllerRole.Arn
+  PolicyArn:
+    Description: "This is the ARN of the policy that is attached to the encryptor controller role."
+    Value: !Ref EncryptorControllerPolicy
+  CloudWatchRuleRef:
+    Description:
+      "This is the CloudWatch rule that checks for whether an S3 bucket was updated
+      with a new target tag. If so, S3 Inventory will be configured for the bucket."
+    Value: !Ref CloudWatchRule
+  GlueDatabaseRef:
+    Description:
+      "This is the Glue database that contains the tables that can be used by Amazon Athena 
+      for easy aggregated querying of S3 Inventory reports and S3 Batch job completion reports."
+    Value: !Ref GlueDatabaseName
